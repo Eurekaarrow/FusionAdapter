@@ -1,6 +1,4 @@
-# Real-Time Infrared-Visible Fusion via Distilled Diffusion Models
-
-**Adding Real-Time Infrared-Visible Fusion to Any Visual System via Knowledge Distillation**
+# Adding Real-Time Infrared-Visible Fusion to Visual System via Distilled Diffusion Models
 
 This project implements a lightweight, real-time infrared-visible image fusion model by distilling knowledge from high-quality diffusion-based fusion models (Teacher) into an efficient student network.
 
