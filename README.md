@@ -137,38 +137,6 @@ data/
     └── TEACHER_FUSED/
 ```
 
-### Generate Teacher Fused Images
-
-**Option 1: Using Pre-trained Diffusion Model (DDFM/Mask-DiFuser)**
-
-```python
-# Example using your Teacher model
-from teacher_model import DDFMFusion
-
-teacher = DDFMFusion.from_pretrained('path/to/checkpoint')
-teacher.eval()
-
-for ir_path, vis_path in image_pairs:
-    ir = load_image(ir_path)
-    vis = load_image(vis_path)
-    
-    fused = teacher.fuse(ir, vis, num_steps=50)  # Multi-step diffusion
-    save_image(fused, f'TEACHER_FUSED/{name}.png')
-```
-
-**Option 2: Using Existing Fusion Methods**
-
-If you don't have a diffusion teacher yet, you can start with traditional methods:
-
-```bash
-# Generate using DenseFuse/DIDFuse as pseudo-teacher
-python scripts/generate_pseudo_teacher.py \
-    --method densefuse \
-    --ir_dir data/raw/IR \
-    --vis_dir data/raw/VIS \
-    --output_dir data/train/TEACHER_FUSED
-```
-
 ### Data Augmentation
 
 The dataset automatically applies:
