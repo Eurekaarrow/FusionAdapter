@@ -5,6 +5,10 @@ import datetime
 import numpy as np
 import torch
 import torch.nn as nn
+
+import torch.multiprocessing 
+torch.multiprocessing.set_sharing_strategy('file_system')
+
 import torch.optim as optim
 from torch.cuda.amp import autocast, GradScaler
 from torch.utils.tensorboard import SummaryWriter
@@ -15,11 +19,20 @@ warnings.filterwarnings('ignore')
 # 导入自定义模块
 import sys
 sys.path.append('src')
-from models.student import create_student_model
+
+# ★★★ 修改 1: 导入新的 ConvNeXt Student 模型 ★★★
+# 请确保您的 student_convnext.py 文件位于 src/models/ 目录下
+from models.student_convnext import create_student_model
 from losses.losses import FusionLoss
 from dataset import create_dataloaders
 from utils import set_seed, save_checkpoint, load_checkpoint
 
+
+device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+if torch.cuda.is_available():
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
 
 # ============================================
 # 训练配置
@@ -33,7 +46,7 @@ def get_args():
                        help='Path to IR images directory')
     parser.add_argument('--vis_root', type=str, default='./data/vi',
                        help='Path to VIS images directory')
-    parser.add_argument('--teacher_root', type=str, default='./DDAEFuse_MSRS',
+    parser.add_argument('--teacher_root', type=str, default='/home/jovyan/Adapter/Mask-DiFuser/Fusion/New',
                        help='Path to Teacher fused images directory')
     
     # 数据集划分参数
@@ -48,35 +61,37 @@ def get_args():
                        help='Input image size')
     
     # 模型参数
-    parser.add_argument('--in_channels', type=int, default=1,
+    parser.add_argument('--in_channels', type=int, default=3,
                        help='Number of input channels (1 for grayscale IR, 3 for RGB)')
     parser.add_argument('--out_channels', type=int, default=3,
                        help='Number of output channels')
     
     # 训练参数
-    parser.add_argument('--batch_size', type=int, default=8,
+    # ★★★ 修改 2: 针对 A100 的默认 Batch Size 和 Workers ★★★
+    parser.add_argument('--batch_size', type=int, default=32,
                        help='Batch size')
-    parser.add_argument('--epochs', type=int, default=120,
+    parser.add_argument('--epochs', type=int, default=160,
                        help='Number of epochs')
-    parser.add_argument('--lr', type=float, default=1e-4,
+    parser.add_argument('--lr', type=float, default=5e-4,
                        help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=1e-4,
                        help='Weight decay')
-    parser.add_argument('--num_workers', type=int, default=4,
+    parser.add_argument('--num_workers', type=int, default=8,
                        help='Number of data loading workers')
     parser.add_argument('--seed', type=int, default=42,
                        help='Random seed')
     
-    # 损失权重
-    parser.add_argument('--lambda_pix', type=float, default=1.0,
-                       help='Weight for pixel loss')
+    # 损失权重 (专家团推荐参数)
+    # ★★★ 修改 3: 更新默认 Loss 权重以增强清晰度 ★★★
+    parser.add_argument('--lambda_pix', type=float, default=0.5,
+                       help='Weight for pixel loss (Reduced to focus on structure)')
     parser.add_argument('--lambda_perc', type=float, default=0.1,
                        help='Weight for perceptual loss')
-    parser.add_argument('--lambda_ssim', type=float, default=1.0,
-                       help='Weight for SSIM loss')
-    parser.add_argument('--lambda_grad', type=float, default=0.5,
-                       help='Weight for gradient loss')
-    parser.add_argument('--lambda_feat', type=float, default=0.5,
+    parser.add_argument('--lambda_ssim', type=float, default=2.0,
+                       help='Weight for SSIM loss (Increased for structure)')
+    parser.add_argument('--lambda_grad', type=float, default=5.0,
+                       help='Weight for gradient loss (Greatly increased for sharpness)')
+    parser.add_argument('--lambda_feat', type=float, default=1.0,
                        help='Weight for feature distillation')
     
     # 增强
@@ -92,7 +107,7 @@ def get_args():
     # 日志和保存
     parser.add_argument('--log_dir', type=str, default='logs',
                        help='Directory for tensorboard logs')
-    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints',
+    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints_convnext',
                        help='Directory for saving checkpoints')
     parser.add_argument('--save_freq', type=int, default=10,
                        help='Save checkpoint every N epochs')
@@ -184,6 +199,10 @@ def train_one_epoch(model, train_loader, criterion, optimizer, scaler,
         vis = vis.to(device)
         teacher = teacher.to(device)
         
+        # 调试：检查输入通道数 (仅在第一个batch打印)
+        if batch_idx == 0 and epoch == 0:
+            print(f"[DEBUG] 训练样本形状 - IR: {ir.shape}, VIS: {vis.shape}, Teacher: {teacher.shape}")
+        
         optimizer.zero_grad()
         
         # Forward pass with AMP
@@ -218,8 +237,8 @@ def train_one_epoch(model, train_loader, criterion, optimizer, scaler,
         # Update progress bar
         pbar.set_postfix({
             'loss': f"{loss_dict['total']:.4f}",
-            'pix': f"{loss_dict['pix']:.4f}",
             'ssim': f"{loss_dict['ssim']:.4f}",
+            'grad': f"{loss_dict['grad']:.4f}",
             'speed': f"{samples_per_sec:.1f} img/s"
         })
         
@@ -235,7 +254,7 @@ def train_one_epoch(model, train_loader, criterion, optimizer, scaler,
                 # 显示IR, VIS, Teacher, Pred
                 n_show = min(4, ir.size(0))
                 vis_images = torch.cat([
-                    ir[:n_show].repeat(1, 3, 1, 1) if ir.size(1) == 1 else ir[:n_show],  # IR可能是单通道
+                    ir[:n_show],  # 直接使用，IR现在应该是3通道
                     vis[:n_show], 
                     teacher[:n_show], 
                     pred[:n_show]
@@ -273,9 +292,22 @@ def validate(model, val_loader, criterion, device, epoch, writer):
     pbar = tqdm(val_loader, desc='Validation')
     
     for batch_idx, (ir, vis, teacher) in enumerate(pbar):
+        
         ir = ir.to(device)
         vis = vis.to(device)
         teacher = teacher.to(device)
+        
+        # ★★★ 修改 4: 修复 Validate 中的紧急通道转换逻辑 ★★★
+        # ConvNeXt 的第一层不是 .stem.conv，而是 .downsample_layers_ir[0][0]
+        # 我们这里做一个鲁棒的检查
+        try:
+            first_layer_weight = model.downsample_layers_ir[0][0].weight
+            if ir.shape[1] == 1 and first_layer_weight.shape[1] == 3:
+                # 只有在非常罕见的情况下（比如验证集处理不一致）才会触发
+                # print(f"⚠️ [VAL] 紧急修复：将1通道IR转换为3通道")
+                ir = ir.repeat(1, 3, 1, 1)
+        except AttributeError:
+            pass # 如果访问不到属性，跳过检查
         
         # Forward pass
         pred, student_feats = model(ir, vis, return_features=True)
@@ -297,7 +329,7 @@ def validate(model, val_loader, criterion, device, epoch, writer):
         if batch_idx == 0:
             n_show = min(4, ir.size(0))
             vis_images = torch.cat([
-                ir[:n_show].repeat(1, 3, 1, 1) if ir.size(1) == 1 else ir[:n_show],
+                ir[:n_show],  # 直接使用，IR现在应该是3通道
                 vis[:n_show], 
                 teacher[:n_show], 
                 pred[:n_show]
@@ -346,17 +378,16 @@ def main():
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     
     # Device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # 注意：这里我们使用 device 变量，它在文件开头已经定义好了
+    # 如果想更严谨，可以从 args 里传 gpu id，但现在保持简单
     print(f"\nUsing device: {device}")
-    if torch.cuda.is_available():
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
-        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
     
     # Create dataloaders (自动划分数据集)
     print("\n" + "="*80)
     print("LOADING DATASET")
     print("="*80)
     
+    # 注意：传递ir_channels参数给create_dataloaders
     train_loader, val_loader, test_loader = create_dataloaders(
         args.ir_root,
         args.vis_root,
@@ -368,13 +399,23 @@ def main():
         train_ratio=args.train_ratio,
         val_ratio=args.val_ratio,
         test_ratio=args.test_ratio,
-        seed=args.seed
+        seed=args.seed,
+        ir_channels=args.in_channels,  # 确保传递这个参数
+        vis_channels=3  # 添加这个参数
     )
     
     print(f"\nDataloader info:")
     print(f"  Train batches: {len(train_loader)}")
     print(f"  Val batches:   {len(val_loader)}")
     print(f"  Test batches:  {len(test_loader)}")
+    
+    # 立即检查第一个batch的形状
+    print("\n检查第一个训练batch的形状:")
+    train_iter = iter(train_loader)
+    ir_sample, vis_sample, teacher_sample = next(train_iter)
+    print(f"  IR shape: {ir_sample.shape} (期望: [batch, {args.in_channels}, {args.input_size}, {args.input_size}])")
+    print(f"  VIS shape: {vis_sample.shape}")
+    print(f"  Teacher shape: {teacher_sample.shape}")
     
     # 初始化时间估算器
     timer = TrainingTimer(args.epochs, len(train_loader))
@@ -385,16 +426,36 @@ def main():
     print("="*80)
     
     # Create model
-    print("\nCreating model...")
+    print("\nCreating model (ConvNeXt-V2)...")
     model = create_student_model(
         in_channels=args.in_channels,
         out_channels=args.out_channels
     ).to(device)
     
+    # 打印模型信息
+    print(f"模型参数: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
+    
+    # ★★★ 修改 5: 修复打印权重形状的代码 ★★★
+    # 访问新的 ConvNeXt 结构
+    try:
+        first_layer_shape = model.downsample_layers_ir[0][0].weight.shape
+        print(f"模型第一层卷积权重形状: {first_layer_shape}")
+    except AttributeError:
+        print("注意: 无法直接访问 .downsample_layers_ir (可能模型结构已更改)，跳过打印。")
+
+    print(f"期待输入通道数: {args.in_channels}")
+    
     # 快速测试一个batch来估算时间
     test_batch = next(iter(train_loader))
     ir_test = test_batch[0].to(device)
     vis_test = test_batch[1].to(device)
+    
+    # 确保输入通道数匹配
+    if ir_test.shape[1] != args.in_channels:
+        print(f"⚠️ 警告：数据IR通道数({ir_test.shape[1]})与模型期待({args.in_channels})不匹配")
+        if ir_test.shape[1] == 1 and args.in_channels == 3:
+            print("  自动修复：将1通道IR复制为3通道")
+            ir_test = ir_test.repeat(1, 3, 1, 1)
     
     # Warmup
     model.train()
@@ -431,6 +492,7 @@ def main():
         lambda_feat=args.lambda_feat,
         device=device
     )
+    print(f"Loss Weights: Pix={args.lambda_pix}, SSIM={args.lambda_ssim}, Grad={args.lambda_grad}, Feat={args.lambda_feat}")
     
     # Create optimizer
     optimizer = optim.AdamW(
